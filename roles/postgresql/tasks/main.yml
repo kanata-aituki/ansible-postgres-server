@@ -49,7 +49,6 @@
     state: enabled
     permanent: true
     immediate: true
-  # ※環境によってはfirewalldが動いていない場合もあるため、ここだけは無視を許容する
   ignore_errors: true
 
 - name: pg_hba.conf に 一般ユーザー向けのパスワード認証(scram-sha-256)を追記する
