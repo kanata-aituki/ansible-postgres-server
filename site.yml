@@ -1,0 +1,9 @@
+---
+- name: Setup PostgreSQL Server
+  hosts: dbservers
+  become: yes
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/secret.yml
+  roles:
+    - postgresql

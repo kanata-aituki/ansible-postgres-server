@@ -1,0 +1,167 @@
+---
+# ============================================================
+# 1. PostgreSQL サーバーのインストール
+# ============================================================
+- name: 最新のPostgreSQLサーバー本体と日本語環境をインストールする
+  ansible.builtin.dnf:
+    name:
+      - postgresql-server
+      - langpacks-ja
+    state: present
+
+# ============================================================
+# 2. データベースクラスタの初期化確認
+# ============================================================
+# 【AlmaLinux/RHEL特有のパス構成】
+# ※Ubuntu等では別途 apt で自動初期化されるため、この処理とパスはRedHat系専用です。
+- name: PostgreSQLが既に初期化済みか（postgresql.confが存在するか）確認する
+  ansible.builtin.stat:
+    path: /var/lib/pgsql/data/postgresql.conf
+  register: pgsql_conf
+
+- name: 未初期化の場合のみ、初期化コマンド(postgresql-setup)を実行する
+  ansible.builtin.command: /usr/bin/postgresql-setup --initdb
+  when: not pgsql_conf.stat.exists
+
+# ============================================================
+# 3. サービスの起動と自動起動設定
+# ============================================================
+- name: PostgreSQLサービスを起動し、次回OS起動時にも自動起動するように有効化する
+  ansible.builtin.systemd:
+    name: postgresql
+    state: started
+    enabled: true
+
+# ============================================================
+# 4. ネットワークとファイアウォールの設定（外部接続許可）
+# ============================================================
+- name: すべてのネットワークインターフェースから接続を受け付けるよう、listen_addresses を '*' に変更する
+  ansible.builtin.lineinfile:
+    path: /var/lib/pgsql/data/postgresql.conf
+    regexp: '^#?listen_addresses\s*='
+    line: "listen_addresses = '{{ postgres_listen_addresses }}'"
+    backup: true # 設定書き換え前には必ず元ファイルのバックアップを取る
+  notify: Restart PostgreSQL
+
+- name: OSのファイアウォール(firewalld)で PostgreSQL標準ポート(5432/tcp)を開放する
+  ansible.posix.firewalld:
+    port: "{{ postgres_port }}/tcp"
+    state: enabled
+    permanent: true
+    immediate: true
+  # ※環境によってはfirewalldが動いていない場合もあるため、ここだけは無視を許容する
+  ignore_errors: true
+
+- name: pg_hba.conf に 一般ユーザー向けのパスワード認証(scram-sha-256)を追記する
+  ansible.builtin.lineinfile:
+    path: /var/lib/pgsql/data/pg_hba.conf
+    line: "host    all             all             0.0.0.0/0               scram-sha-256"
+    insertafter: EOF
+    backup: true
+  notify: Restart PostgreSQL
+
+
+  
+# 設定ファイル(postgresql.conf, pg_hba.conf)を反映するために、
+# 後続のDB作成処理などを実行する前にここで一度強制的に再起動させる
+- name: ここまでの設定変更に伴う 再起動ハンドラー を今すぐ実行させる
+  ansible.builtin.meta: flush_handlers
+
+# ============================================================
+# 5. AnsibleからPostgreSQLを操作するための準備
+# ============================================================
+- name: AnsibleモジュールがSQLコマンドを実行するために必要なPythonライブラリ(psycopg2)をインストールする
+  ansible.builtin.dnf:
+    name: python3-psycopg2
+    state: present
+
+# ============================================================
+# 6. ユーザー・データベース・権限の作成
+# ============================================================
+- name: アプリケーションから接続する専用のユーザー(db_user)を作成し、パスワードを設定する
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_user:
+    name: "{{ db_user }}"
+    password: "{{ db_password }}"
+    role_attr_flags: SUPERUSER,CREATEDB  # アプリケーションユーザーにもスーパーユーザー権限とDB作成権限を付与
+
+- name: アプリケーション専用のデータベース(db_name)を作成し、所有者を db_user にする
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_db:
+    name: "{{ db_name }}"
+    owner: "{{ db_user }}"
+
+- name: 作成したデータベースに対する全権限(ALL)を専用ユーザーに付与する
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_privs:
+    db: "{{ db_name }}"
+    privs: ALL
+    type: database
+    role: "{{ db_user }}"
+
+# ============================================================
+# 7. システム共通設定管理テーブル（魔法の箱）の作成
+# ============================================================
+- name: アプリの挙動を管理する共通テーブル(system_parameters)を作成する
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_query:
+    db: "{{ db_name }}"
+    # IF NOT EXISTS によって、既にテーブルがあってもエラーにせず正常終了（冪等性確保）
+    query: |
+      CREATE TABLE IF NOT EXISTS system_parameters (
+          parameter_key   TEXT PRIMARY KEY,
+          parameter_value TEXT NOT NULL,
+          description     TEXT,
+          updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+  # 以前あった ignore_errors: true を削除し、本当のエラーは検知できるようにした
+
+- name: 魔法の箱 行更新時に updated_at を自動更新する関数を作成・更新する
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_query:
+    db: "{{ db_name }}"
+    # OR REPLACE によって、既に関数があっても上書き更新する形にし、エラーを防ぐ（冪等性確保）
+    query: |
+      CREATE OR REPLACE FUNCTION update_timestamp()
+      RETURNS TRIGGER AS $$
+      BEGIN
+          NEW.updated_at = CURRENT_TIMESTAMP;
+          RETURN NEW;
+      END;
+      $$ language 'plpgsql';
+
+- name: 魔法の箱 自動更新トリガーがすでに存在するかチェックする
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_query:
+    db: "{{ db_name }}"
+    query: "SELECT 1 FROM pg_trigger WHERE tgname = 'trg_system_parameters_update';"
+  register: trigger_check
+
+- name: 未作成の場合のみ、自動更新トリガー(CREATE TRIGGER)を作成する
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_query:
+    db: "{{ db_name }}"
+    query: |
+      CREATE TRIGGER trg_system_parameters_update
+          BEFORE UPDATE ON system_parameters
+          FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+  # TRIGGERの作成は「IF NOT EXISTS」が使えないので、事前チェックの結果で制御する
+  when: trigger_check is defined and trigger_check.rowcount == 0
+
+- name: 魔法の箱 初期設定値（メンテナンスモードフラグ）を投入する
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_query:
+    db: "{{ db_name }}"
+    # ON CONFLICT (parameter_key) DO NOTHING により、既に同じキーがあれば何もしない（冪等性確保）
+    query: >
+      INSERT INTO system_parameters (parameter_key, parameter_value, description)
+      VALUES ('is_maintenance_mode', 'false', 'システムメンテナンス中フラグ (true/false)')
+      ON CONFLICT (parameter_key) DO NOTHING;

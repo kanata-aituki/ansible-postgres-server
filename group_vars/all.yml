@@ -1,0 +1,8 @@
+---
+postgres_version: "16" # AlmaLinux 10 標準リポジトリ想定
+postgres_listen_addresses: "*"
+postgres_port: "5432"
+
+# アプリ用データ
+db_name: "db_sample"
+db_user: "db_user"
