@@ -2,11 +2,19 @@
 
 Ansibleを使用して、AlmaLinux 10環境におけるPostgreSQL 16 のインストール、外部接続許可、およびシステム共通設定管理用テーブルのセットアップ手順を自動化するプロジェクトです。
 
-## クイックスタート
+## クイックスタート (導入手順)
 
-以下のスクリプトを実行するだけで、AnsibleのインストールからPlaybookの適用まで完了します。
+はじめてサーバーに導入する際は、まず `git` をインストールし、このプロジェクトをサーバーにダウンロード（クローン）する必要があります。
 
 ```bash
+# 1. git のインストール (root権限で実行)
+dnf install -y git
+
+# 2. プロジェクトのダウンロードと移動
+git clone https://github.com/kanata-aituki/ansible-postgres-server.git
+cd ansible-postgres-server
+
+# 3. セットアップの実行 (AnsibleのインストールからPlaybookの適用まで完了します)
 chmod +x setup.sh
 ./setup.sh
 ```
