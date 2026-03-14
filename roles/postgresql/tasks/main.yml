@@ -7,6 +7,7 @@
     name:
       - postgresql-server
       - langpacks-ja
+      - python3-firewall
     state: present
 
 # ============================================================
